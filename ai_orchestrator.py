@@ -22,7 +22,21 @@ def create_get_demographic_data_tool():
 
     get_demographic_data_declaration = FunctionDeclaration(
         name="get_demographic_data",
-        description="Fetches demographic data from the US Census Bureau for data visualization and maps. Use this tool whenever users ask for maps, charts, or specific demographic data. For map requests, use 'state' level for US-wide maps or 'county' level for state-specific maps.",
+        description="""Fetches demographic data from the US Census Bureau for data visualization and interactive maps. 
+
+ALWAYS use this tool when users ask for:
+- Maps (e.g., "map of population by state", "show me a map", "map median income")
+- Charts or visualizations of demographic data
+- County-level data for any state
+- State-level data across the US
+- Any demographic statistics (population, income, age, housing, etc.)
+
+For MAP REQUESTS:
+- Use geography_level="state" for US-wide state maps
+- Use geography_level="county" for county maps within a state (requires state_name)
+- The system will automatically create interactive choropleth maps
+
+For COUNTY REQUESTS: Always include the state_name parameter (e.g., "California", "Texas", "New York")""",
         parameters={
             "type": "object",
             "properties": {
@@ -75,13 +89,30 @@ async def get_ai_response(user_query: str, chat_history: list = None) -> dict:
     For Phase 3, returns structured responses for map requests.
     """
     try:
-        # Phase 3: Detect map requests
-        is_map_request = any(keyword in user_query.lower() for keyword in ['map', 'show me', 'display', 'visualize', 'chart'])
+        # Phase 3: Detect map requests with better keywords
+        map_keywords = ['map', 'show me', 'display', 'visualize', 'chart', 'counties', 'states', 'income', 'population', 'demographic']
+        is_map_request = any(keyword in user_query.lower() for keyword in map_keywords)
         
         current_chat_session = model.start_chat(history=chat_history or [])
         
+        # Add system instruction for map requests
+        system_instruction = """You are a Census data visualization assistant. When users ask for maps, demographic data, or statistics about states/counties, you should ALWAYS use the get_demographic_data tool. 
+
+Examples that require the tool:
+- "Map median income for California counties" → Use get_demographic_data with geography_level="county", state_name="California"
+- "Show population by state" → Use get_demographic_data with geography_level="state"
+- "Counties in Texas" → Use get_demographic_data with geography_level="county", state_name="Texas"
+
+The tool will provide data that gets automatically converted into interactive maps."""
+        
         print(f"\nSending to Gemini (1st call): Query: '{user_query}' (Map request: {is_map_request})")
-        response = await current_chat_session.send_message_async(user_query)
+        
+        # For map requests, prepend instruction
+        if is_map_request:
+            enhanced_query = f"{system_instruction}\n\nUser request: {user_query}"
+            response = await current_chat_session.send_message_async(enhanced_query)
+        else:
+            response = await current_chat_session.send_message_async(user_query)
         
         # It's good practice to check if candidates exist and have content
         if not response.candidates or not response.candidates[0].content.parts:

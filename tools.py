@@ -54,7 +54,9 @@ async def get_demographic_data(
         if not state_fips:
             return {"error": f"Invalid state name: {state_name}"}
 
-    if normalized_geo_level in ["county", "tract", "block group"]:
+    # Phase 3: For county-level mapping, we get ALL counties in a state, so county_name is not required
+    # Only require county_name for specific tract/block group queries
+    if normalized_geo_level in ["tract", "block group"]:
         if not county_name:
             return {"error": f"County name is required for geography level: {normalized_geo_level}"}
         # County FIPS will be looked up by the CensusAPIClient or needs a more complex lookup here
