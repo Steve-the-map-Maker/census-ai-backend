@@ -46,7 +46,8 @@ async def get_demographic_data(
     county_fips = None
     place_fips = None # Placeholder for future place FIPS lookup if needed directly
 
-    if normalized_geo_level != "us":
+    # For state-level queries (Phase 3), we don't require state_name since we get all states
+    if normalized_geo_level not in ["us", "state"]:
         if not state_name:
             return {"error": f"State name is required for geography level: {normalized_geo_level}"}
         state_fips = STATE_FIPS_MAP.get(state_name.lower())
@@ -62,13 +63,21 @@ async def get_demographic_data(
     # 3. Map user-friendly variable names to Census variable IDs
     census_vars = []
     unknown_vars = []
+    print(f"Input variables: {variables}")
     for var_name in variables:
         normalized_var_name = var_name.lower() # Normalize once
+        print(f"Checking variable: '{var_name}' -> normalized: '{normalized_var_name}'")
         if normalized_var_name in CENSUS_VARIABLE_MAP: # CORRECTED: Check directly against CENSUS_VARIABLE_MAP keys
-            census_vars.append(CENSUS_VARIABLE_MAP[normalized_var_name])
+            census_var_id = CENSUS_VARIABLE_MAP[normalized_var_name]
+            census_vars.append(census_var_id)
+            print(f"Mapped '{normalized_var_name}' to '{census_var_id}'")
         else:
             unknown_vars.append(var_name)
+            print(f"Unknown variable: '{var_name}'")
 
+    print(f"Final census_vars: {census_vars}")
+    print(f"Unknown vars: {unknown_vars}")
+    
     if unknown_vars:
         return {"error": f"Unknown variables: {', '.join(unknown_vars)}. Please check available variables."}
     if not census_vars:
@@ -79,77 +88,42 @@ async def get_demographic_data(
     in_queries = {}
 
     if normalized_geo_level == "us":
-        for_query = "us:1" # Special case for US
+        for_query = "us:1" # Special case for US - single value
+        
     elif normalized_geo_level == "state":
-        for_query = f"state:{state_fips}"
+        # Phase 3: For state-level maps, get ALL states for choropleth visualization
+        for_query = "state:*" # Get all states
+        # No in_queries needed for states
+        
     elif normalized_geo_level == "county":
-        for_query = f"county:*" # Get all counties
-        in_queries["state"] = state_fips
-        if county_name: # If specific county is requested, this needs more specific handling
-             # This part is tricky: mapping county name to FIPS without knowing the state first.
-             # The CensusAPIClient's get_acs5_data expects FIPS.
-             # We might need a helper function to get county FIPS by name and state FIPS.
-             # For now, we'll assume the API client can handle county name if state FIPS is provided,
-             # or this part needs refinement.
-             # A direct query for a specific county by name usually requires its FIPS.
-             # Let's assume for now we want all counties in a state if no specific county FIPS is found.
-             # If a county_name is provided, we'd ideally resolve it to its FIPS code here.
-             # This is a simplification for now.
-             pass
+        # Phase 3: For county-level maps, get all counties within a specific state
+        if not state_name:
+            return {"error": "State name is required for county-level queries. Example: 'Show counties in California'"}
+        for_query = "county:*" # Get all counties
+        in_queries["state"] = state_fips # Within the specified state
+        
     elif normalized_geo_level == "place":
-        for_query = f"place:*" # Get all places in a state
-        in_queries["state"] = state_fips
-        # Similar to county, resolving place_name to FIPS would be needed for specific place.
+        # Get all places (cities, towns) within a specific state
+        if not state_name:
+            return {"error": "State name is required for place-level queries. Example: 'Show cities in Oregon'"}
+        for_query = "place:*" # Get all places
+        in_queries["state"] = state_fips # Within the specified state
+        
+    elif normalized_geo_level == "zip code tabulation area":
+        # ZCTA queries - can be national or state-specific
+        if zip_code_tabulation_area:
+            for_query = f"zip code tabulation area:{zip_code_tabulation_area}" # Specific ZCTA
+        else:
+            for_query = "zip code tabulation area:*" # All ZCTAs
+            if state_fips: # Optionally filter by state
+                in_queries["state"] = state_fips
+                
     elif normalized_geo_level == "tract":
-        if not county_name: # County name is essential for tract queries
-            return {"error": "County name is required for tract level queries."}
-        for_query = f"tract:*"
-        in_queries["state"] = state_fips
-        # County FIPS is needed here. This is a known gap.
-        # We'd need to look up county FIPS from county_name and state_fips.
-        # For now, this will likely fail or fetch all tracts in a state if county_fips isn't resolved.
-        # Let's assume county_name is passed and client handles it, or we refine this.
-        # The API usually requires county FIPS for 'in' clause for tracts.
-        # This needs a robust county FIPS lookup.
-        # For now, we'll pass county_name and assume client or a future step resolves it.
-        # This is a simplification.
-        # A more robust solution would be:
-        # county_fips = await get_county_fips_by_name(county_name, state_fips)
-        # if not county_fips:
-        #     return {"error": f"Could not find FIPS for county: {county_name} in state: {state_name}"}
-        # in_queries["county"] = county_fips
-        # For now, we'll rely on the census_api_client to handle this if possible, or flag for improvement.
-        # The current census_api_client expects FIPS codes in in_queries.
-        # This will require modification or a helper.
-        # Let's assume for now we are querying all tracts in a state, and filter later if county_name is given.
-        # Or, the AI orchestrator should be prompted to provide county FIPS if county_name is given.
-        # This is a complex part of name-to-FIPS resolution.
-        # For the initial tool, let's keep it simpler and highlight this as an area for enhancement.
-        # The `census_api_client` expects FIPS codes.
-        # We need a way to get county FIPS from county_name and state_fips.
-        # This is not directly in `STATE_FIPS_MAP`.
-        # For now, this tool will be limited for sub-state queries by name without FIPS.
-        # Let's assume the AI will provide FIPS codes if it knows them, or we handle simple cases.
-        # The current structure of `get_acs5_data` expects FIPS.
-        # We will need to add a county FIPS lookup.
-        # For now, let's make a note that this part is incomplete for named counties.
-        # The API call will be: client.get_acs5_data(variables=census_vars, for_query=f"tract:*", in_queries={"state": state_fips, "county": "COUNTY_FIPS_HERE"})
-        # This means we MUST resolve county_name to county_fips.
-        # This is a critical step.
-        # For now, if county_name is provided but we can't get FIPS, we should error or return all tracts in state.
-        # Let's return an error if county_name is given but we can't resolve it yet.
-        # This functionality (name to FIPS for counties/places) is non-trivial.
-        return {"error": "Querying by county_name without providing county FIPS is not yet supported. Please provide state and county FIPS codes for tract queries or query all tracts in a state."}
-
-    elif normalized_geo_level == "block group":
-        # Similar to tract, requires state and county FIPS.
-        return {"error": "Querying by block group is not yet fully supported by name. Please provide state and county FIPS codes."}
-    elif normalized_geo_level == "zcta":
-        for_query = f"zip code tabulation area:{zip_code_tabulation_area if zip_code_tabulation_area else '*'}"
-        if state_fips: # ZCTAs can span states, but often queried within a state context
-            in_queries["state"] = state_fips
+        # Census tracts require both state and county - not supported in Phase 3
+        return {"error": "Tract-level queries are not yet supported in Phase 3. Please use state or county level."}
+        
     else:
-        return {"error": f"Logic for geography level '{normalized_geo_level}' is not fully implemented."}
+        return {"error": f"Geographic level '{normalized_geo_level}' is not supported. Supported levels: us, state, county, place, zip code tabulation area."}
 
 
     # 5. Call CensusAPIClient

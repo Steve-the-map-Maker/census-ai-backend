@@ -35,11 +35,15 @@ async def ask_ai(query_data: dict):
 
     print(f"Received query: {user_query}")
     try:
-        ai_response_text = await ai_orchestrator.get_ai_response(user_query)
-        return {"response": ai_response_text}
+        ai_response = await ai_orchestrator.get_ai_response(user_query)
+        # Phase 3: ai_response is now a dict, not just a string
+        print(f"AI response: {ai_response}")
+        return ai_response
     except Exception as e:
         print(f"Error during AI processing: {e}")
-        raise HTTPException(status_code=500, detail="Error processing your request with the AI.")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error processing your request with the AI: {str(e)}")
 
 # Placeholder for GOOGLE_API_KEY, will be used in ai_orchestrator.py
 # GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
