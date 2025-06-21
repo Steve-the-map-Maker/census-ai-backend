@@ -12,6 +12,7 @@ app = FastAPI()
 origins = [
     "http://localhost:5173",  # Default Vite frontend URL
     "http://127.0.0.1:5173", # Also common for Vite
+    "https://census-ai-frontend.onrender.com",  # Production frontend URL
     # Add any other origins if your frontend is served from a different port/domain
 ]
 
