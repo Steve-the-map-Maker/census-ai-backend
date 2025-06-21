@@ -87,7 +87,12 @@ async def get_ai_response(user_query: str, chat_history: list = None) -> dict:
     2. We execute the tool and send the result back to the LLM for interpretation.
     
     For Phase 3, returns structured responses for map requests.
+    Tracks token usage for each response.
     """
+    # Initialize token counters
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    
     try:
         # Phase 3: Detect map requests with better keywords
         map_keywords = ['map', 'show me', 'display', 'visualize', 'chart', 'counties', 'states', 'income', 'population', 'demographic']
@@ -114,9 +119,22 @@ The tool will provide data that gets automatically converted into interactive ma
         else:
             response = await current_chat_session.send_message_async(user_query)
         
+        # Track token usage from first LLM call
+        if response.usage_metadata:
+            total_prompt_tokens += response.usage_metadata.prompt_token_count
+            total_completion_tokens += response.usage_metadata.candidates_token_count
+            print(f"Token usage (1st call): Prompt={response.usage_metadata.prompt_token_count}, Completion={response.usage_metadata.candidates_token_count}")
+        
         # It's good practice to check if candidates exist and have content
         if not response.candidates or not response.candidates[0].content.parts:
-            return {"response": "AI did not return a valid response structure."}
+            return {
+                "response": "AI did not return a valid response structure.",
+                "token_usage": {
+                    "prompt_tokens": total_prompt_tokens,
+                    "completion_tokens": total_completion_tokens,
+                    "total_tokens": total_prompt_tokens + total_completion_tokens
+                }
+            }
         response_part = response.candidates[0].content.parts[0]
 
         if hasattr(response_part, 'function_call') and response_part.function_call:
@@ -171,7 +189,12 @@ The tool will provide data that gets automatically converted into interactive ma
                                     "variables": list(args.get("variables", [])),
                                     "state_name": str(args.get("state_name")) if args.get("state_name") else None
                                 },
-                                "summary": f"Map showing {args.get('variables', ['data'])[0]} at {args.get('geography_level', 'unknown')} level"
+                                "summary": f"Map showing {args.get('variables', ['data'])[0]} at {args.get('geography_level', 'unknown')} level",
+                                "token_usage": {
+                                    "prompt_tokens": total_prompt_tokens,
+                                    "completion_tokens": total_completion_tokens,
+                                    "total_tokens": total_prompt_tokens + total_completion_tokens
+                                }
                             }
                             print(f"Returning map response: {response}")
                             return response
@@ -206,29 +229,84 @@ The tool will provide data that gets automatically converted into interactive ma
                 # Send the list containing the function response dictionary
                 response_after_tool = await current_chat_session.send_message_async(function_response_content_for_llm)
                 
+                # Track token usage from second LLM call
+                if response_after_tool.usage_metadata:
+                    total_prompt_tokens += response_after_tool.usage_metadata.prompt_token_count
+                    total_completion_tokens += response_after_tool.usage_metadata.candidates_token_count
+                    print(f"Token usage (2nd call): Prompt={response_after_tool.usage_metadata.prompt_token_count}, Completion={response_after_tool.usage_metadata.candidates_token_count}")
+                
                 if not response_after_tool.candidates or not response_after_tool.candidates[0].content.parts:
-                    return {"response": "AI did not return a valid response structure after tool execution."}
+                    return {
+                        "response": "AI did not return a valid response structure after tool execution.",
+                        "token_usage": {
+                            "prompt_tokens": total_prompt_tokens,
+                            "completion_tokens": total_completion_tokens,
+                            "total_tokens": total_prompt_tokens + total_completion_tokens
+                        }
+                    }
                 final_response_part = response_after_tool.candidates[0].content.parts[0]
 
                 if hasattr(final_response_part, 'text'):
-                    return {"response": final_response_part.text}
+                    return {
+                        "response": final_response_part.text,
+                        "token_usage": {
+                            "prompt_tokens": total_prompt_tokens,
+                            "completion_tokens": total_completion_tokens,
+                            "total_tokens": total_prompt_tokens + total_completion_tokens
+                        }
+                    }
                 else:
-                    return {"response": "AI processed tool output, but no text response was generated."}
+                    return {
+                        "response": "AI processed tool output, but no text response was generated.",
+                        "token_usage": {
+                            "prompt_tokens": total_prompt_tokens,
+                            "completion_tokens": total_completion_tokens,
+                            "total_tokens": total_prompt_tokens + total_completion_tokens
+                        }
+                    }
             else:
-                return {"response": f"Error: Model tried to call unknown function '{function_name}'."}
+                return {
+                    "response": f"Error: Model tried to call unknown function '{function_name}'.",
+                    "token_usage": {
+                        "prompt_tokens": total_prompt_tokens,
+                        "completion_tokens": total_completion_tokens,
+                        "total_tokens": total_prompt_tokens + total_completion_tokens
+                    }
+                }
         
         elif hasattr(response_part, 'text'):
-            return {"response": response_part.text}
+            return {
+                "response": response_part.text,
+                "token_usage": {
+                    "prompt_tokens": total_prompt_tokens,
+                    "completion_tokens": total_completion_tokens,
+                    "total_tokens": total_prompt_tokens + total_completion_tokens
+                }
+            }
         
-        return {"response": "Sorry, I couldn't generate a valid response (no function call or text)."}
+        return {
+            "response": "Sorry, I couldn't generate a valid response (no function call or text).",
+            "token_usage": {
+                "prompt_tokens": total_prompt_tokens,
+                "completion_tokens": total_completion_tokens,
+                "total_tokens": total_prompt_tokens + total_completion_tokens
+            }
+        }
 
     except Exception as e:
         print(f"Error in get_ai_response: {e}")
         import traceback
         traceback.print_exc()
-        return {"response": "Sorry, there was a critical error in the AI orchestration."}
+        return {
+            "response": "Sorry, there was a critical error in the AI orchestration.",
+            "token_usage": {
+                "prompt_tokens": total_prompt_tokens,
+                "completion_tokens": total_completion_tokens,
+                "total_tokens": total_prompt_tokens + total_completion_tokens
+            }
+        }
 
-if __name__ == '__main__':
+# if __name__ == '__main__':
     async def main_test():
         print("=== COMPREHENSIVE PHASE 2 TESTING ===\n")
         

@@ -38,6 +38,14 @@ async def ask_ai(query_data: dict):
         ai_response = await ai_orchestrator.get_ai_response(user_query)
         # Phase 3: ai_response is now a dict, not just a string
         print(f"AI response: {ai_response}")
+        
+        # Log token usage if available
+        if isinstance(ai_response, dict) and "token_usage" in ai_response:
+            token_info = ai_response["token_usage"]
+            print(f"Token usage - Prompt: {token_info.get('prompt_tokens', 0)}, "
+                  f"Completion: {token_info.get('completion_tokens', 0)}, "
+                  f"Total: {token_info.get('total_tokens', 0)}")
+        
         return ai_response
     except Exception as e:
         print(f"Error during AI processing: {e}")
@@ -45,7 +53,4 @@ async def ask_ai(query_data: dict):
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error processing your request with the AI: {str(e)}")
 
-# Placeholder for GOOGLE_API_KEY, will be used in ai_orchestrator.py
-# GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-# if not GOOGLE_API_KEY:
-#     print("Warning: GOOGLE_API_KEY not found in .env file.")
+
