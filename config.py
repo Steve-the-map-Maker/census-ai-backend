@@ -69,3 +69,25 @@ GEOGRAPHY_ALIASES = {
     "metro area": "metropolitan statistical area",
     "census tract": "tract",
 }
+
+# Defines calculations that can be performed on raw Census data.
+# 'name': Human-readable name for the metric.
+# 'required_variables': List of keys from CENSUS_VARIABLE_MAP needed for the calculation.
+# 'calculation': A lambda function to compute the new value from a data row.
+DERIVED_METRICS_MAP = {
+    "male_female_difference": {
+        "name": "Male-Female Population Difference",
+        "required_variables": ["male_population", "female_population"],
+        "calculation": lambda row, labels: float(row.get(labels["male_population"], 0)) - float(row.get(labels["female_population"], 0))
+    },
+    "unemployment_percentage": {
+        "name": "Unemployment Rate (%)",
+        "required_variables": ["unemployment_rate", "employment_rate"],
+        "calculation": lambda row, labels: (float(row.get(labels["unemployment_rate"], 0)) / (float(row.get(labels["unemployment_rate"], 0)) + float(row.get(labels["employment_rate"], 0)))) * 100 if (float(row.get(labels["unemployment_rate"], 0)) + float(row.get(labels["employment_rate"], 0))) > 0 else 0
+    },
+    "owner_occupied_percentage": {
+        "name": "Owner-Occupied Housing Rate (%)",
+        "required_variables": ["owner_occupied_housing_units", "total_housing_units"],
+        "calculation": lambda row, labels: (float(row.get(labels["owner_occupied_housing_units"], 0)) / float(row.get(labels["total_housing_units"], 1))) * 100 if float(row.get(labels["total_housing_units"], 1)) > 0 else 0
+    }
+}

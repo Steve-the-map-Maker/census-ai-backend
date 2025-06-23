@@ -6,7 +6,7 @@ import asyncio
 
 # Import the new tool and config for schema generation
 from tools import get_demographic_data # TEMP: absolute import for testing
-from config import CENSUS_VARIABLE_MAP, GEOGRAPHY_HIERARCHY # TEMP: absolute import for testing
+from config import CENSUS_VARIABLE_MAP, GEOGRAPHY_HIERARCHY, DERIVED_METRICS_MAP # TEMP: absolute import for testing
 
 load_dotenv()
 
@@ -19,6 +19,7 @@ genai.configure(api_key=api_key)
 def create_get_demographic_data_tool():
     user_friendly_variable_names = list(CENSUS_VARIABLE_MAP.keys())
     geography_level_names = list(GEOGRAPHY_HIERARCHY.keys())
+    derived_metric_names = list(DERIVED_METRICS_MAP.keys())
 
     get_demographic_data_declaration = FunctionDeclaration(
         name="get_demographic_data",
@@ -30,11 +31,16 @@ ALWAYS use this tool when users ask for:
 - County-level data for any state
 - State-level data across the US
 - Any demographic statistics (population, income, age, housing, etc.)
+- Comparative queries (e.g., "Which states have more men than women?", "States with highest unemployment")
 
 For MAP REQUESTS:
 - Use geography_level="state" for US-wide state maps
 - Use geography_level="county" for county maps within a state (requires state_name)
 - The system will automatically create interactive choropleth maps
+
+For COMPARATIVE QUERIES:
+- Use derived_metrics for calculated comparisons (e.g., male_female_difference, unemployment_percentage)
+- Derived metrics automatically compute differences, ratios, and percentages
 
 For COUNTY REQUESTS: Always include the state_name parameter (e.g., "California", "Texas", "New York")""",
         parameters={
@@ -53,6 +59,14 @@ For COUNTY REQUESTS: Always include the state_name parameter (e.g., "California"
                         "enum": user_friendly_variable_names,
                     },
                 },
+                "derived_metrics": {
+                    "type": "array",
+                    "description": "A list of derived/calculated metrics to compute (e.g., for comparisons like 'more men than women').",
+                    "items": {
+                        "type": "string",
+                        "enum": derived_metric_names,
+                    },
+                },
                 # Simplified parameter descriptions for brevity in this test
                 "state_name": {"type": "string", "description": "The name of the state (not required for state-level queries when getting all states)."},
                 "county_name": {"type": "string", "description": "The name of the county."},
@@ -61,7 +75,7 @@ For COUNTY REQUESTS: Always include the state_name parameter (e.g., "California"
                 "block_group_code": {"type": "string", "description": "The block group code."},
                 "zip_code_tabulation_area": {"type": "string", "description": "The 5-digit ZCTA code."},
             },
-            "required": ["geography_level", "variables"],
+            "required": ["geography_level"],
         },
     )
     # Ensure Tool is used correctly here
@@ -72,7 +86,20 @@ census_tool = create_get_demographic_data_tool()
 model = genai.GenerativeModel(
     model_name='gemini-1.5-flash',
     tools=[census_tool],
-    system_instruction="You are a helpful assistant that provides US Census demographic data and visualizations. When users ask for maps, charts, or data visualization, always use the get_demographic_data tool to fetch the required data. For US-wide maps, use geography_level='state'. For state-specific maps, use geography_level='county' and include the state_name parameter."
+    system_instruction="""You are a helpful assistant that provides US Census demographic data and visualizations. When users ask for maps, charts, or data visualization, always use the get_demographic_data tool to fetch the required data. 
+
+For US-wide maps, use geography_level='state'. For state-specific maps, use geography_level='county' and include the state_name parameter.
+
+For comparative queries (e.g., "Which states have more men than women?", "States with highest unemployment"), use derived_metrics without needing variables:
+- male_female_difference: Calculates difference between male and female population
+- unemployment_percentage: Calculates unemployment rate as a percentage  
+- owner_occupied_percentage: Calculates owner-occupied housing percentage
+
+You can use EITHER variables OR derived_metrics or both. The geography_level is the only required parameter.
+
+Available derived metrics: male_female_difference, unemployment_percentage, owner_occupied_percentage
+
+When users ask comparative questions, determine the appropriate derived metric and use it to create meaningful visualizations."""
 )
 
 AVAILABLE_FUNCTIONS = {
@@ -104,9 +131,13 @@ async def get_ai_response(user_query: str, chat_history: list = None) -> dict:
         system_instruction = """You are a Census data visualization assistant. When users ask for maps, demographic data, or statistics about states/counties, you should ALWAYS use the get_demographic_data tool. 
 
 Examples that require the tool:
-- "Map median income for California counties" → Use get_demographic_data with geography_level="county", state_name="California"
-- "Show population by state" → Use get_demographic_data with geography_level="state"
+- "Map median income for California counties" → Use get_demographic_data with geography_level="county", state_name="California", variables=["median_household_income"]
+- "Show population by state" → Use get_demographic_data with geography_level="state", variables=["total_population"]
 - "Counties in Texas" → Use get_demographic_data with geography_level="county", state_name="Texas"
+- "Which states have more men than women?" → Use get_demographic_data with geography_level="state", derived_metrics=["male_female_difference"]
+- "States with highest unemployment" → Use get_demographic_data with geography_level="state", derived_metrics=["unemployment_percentage"]
+
+For comparative queries, use derived_metrics instead of or in addition to variables.
 
 The tool will provide data that gets automatically converted into interactive maps."""
         
@@ -162,17 +193,51 @@ The tool will provide data that gets automatically converted into interactive ma
                         print("Map request detected with valid data, creating structured response")
                         # tool_execution_result is already a list of data items
                         data_items = tool_execution_result
-                        # Find the first non-FIPS variable (these are typically the demographic data)
+                        
+                        # Create variable labels mapping for human-readable names
+                        variable_labels = {}
+                        
+                        # Add labels for regular variables (both human-readable keys and Census codes)
+                        for var_key, census_code in CENSUS_VARIABLE_MAP.items():
+                            human_readable_name = var_key.replace("_", " ").title()
+                            variable_labels[var_key] = human_readable_name  # human-readable key -> name
+                            variable_labels[census_code] = human_readable_name  # Census code -> name
+                        
+                        # Add labels for derived metrics
+                        for metric_key, metric_info in DERIVED_METRICS_MAP.items():
+                            variable_labels[metric_key] = metric_info["name"]
+                        
+                        # Find the display variable - prioritize derived metrics, then regular variables
                         sample_item = data_items[0]
-                        variable_id = None
-                        for key in sample_item.keys():
-                            if key not in ['state', 'county', 'tract', 'place', 'zip code tabulation area']:
-                                variable_id = key
-                                break
+                        display_variable_id = None
                         
-                        print(f"Found variable_id: {variable_id}")
+                        # First, check if we have any derived metrics (they take priority for display)
+                        requested_derived_metrics = args.get("derived_metrics", [])
+                        if requested_derived_metrics:
+                            # Use the first derived metric as the display variable
+                            for metric in requested_derived_metrics:
+                                if metric in sample_item:
+                                    display_variable_id = metric
+                                    break
                         
-                        if variable_id:
+                        # If no derived metrics, find the first regular variable
+                        if not display_variable_id:
+                            requested_variables = args.get("variables", [])
+                            for var in requested_variables:
+                                if var in sample_item:
+                                    display_variable_id = var
+                                    break
+                        
+                        # Fallback: find any non-geographic variable
+                        if not display_variable_id:
+                            for key in sample_item.keys():
+                                if key not in ['state', 'county', 'tract', 'place', 'zip code tabulation area']:
+                                    display_variable_id = key
+                                    break
+                        
+                        print(f"Found display_variable_id: {display_variable_id}")
+                        
+                        if display_variable_id:
                             # Return structured map response - ensure all data is JSON serializable
                             import json
                             try:
@@ -180,16 +245,25 @@ The tool will provide data that gets automatically converted into interactive ma
                             except:
                                 serializable_data = data_items  # fallback
                             
+                            # Create summary based on what type of variable is being displayed
+                            if display_variable_id in DERIVED_METRICS_MAP:
+                                summary = f"Map showing {DERIVED_METRICS_MAP[display_variable_id]['name']} at {args.get('geography_level', 'unknown')} level"
+                            else:
+                                var_name = variable_labels.get(display_variable_id, display_variable_id)
+                                summary = f"Map showing {var_name} at {args.get('geography_level', 'unknown')} level"
+                            
                             response = {
                                 "type": "map",
                                 "data": serializable_data,
                                 "metadata": {
                                     "geography_level": str(args.get("geography_level", "")),
-                                    "variable_id": str(variable_id),
+                                    "display_variable_id": str(display_variable_id),
+                                    "variable_labels": variable_labels,
                                     "variables": list(args.get("variables", [])),
+                                    "derived_metrics": list(args.get("derived_metrics", [])),
                                     "state_name": str(args.get("state_name")) if args.get("state_name") else None
                                 },
-                                "summary": f"Map showing {args.get('variables', ['data'])[0]} at {args.get('geography_level', 'unknown')} level",
+                                "summary": summary,
                                 "token_usage": {
                                     "prompt_tokens": total_prompt_tokens,
                                     "completion_tokens": total_completion_tokens,
@@ -306,33 +380,3 @@ The tool will provide data that gets automatically converted into interactive ma
             }
         }
 
-# if __name__ == '__main__':
-    async def main_test():
-        print("=== COMPREHENSIVE PHASE 2 TESTING ===\n")
-        
-        # Test Case 1: US Population (already working)
-        print("--- Test Case 1: US Total Population ---")
-        response1 = await get_ai_response("What is the total population of the United States?")
-        print(f"AI Response 1: {response1}\n")
-
-        # Test Case 2: State-level data with multiple variables
-        print("--- Test Case 2: Oregon Population and Median Age ---")  
-        response2 = await get_ai_response("What is the total population and median age in Oregon?")
-        print(f"AI Response 2: {response2}\n")
-
-        # Test Case 3: Case-insensitive state name
-        print("--- Test Case 3: Lowercase State Name ---")
-        response3 = await get_ai_response("What is the population of california?")
-        print(f"AI Response 3: {response3}\n")
-
-        # Test Case 4: Invalid state (error handling)
-        print("--- Test Case 4: Invalid State Name ---")
-        response4 = await get_ai_response("What is the population of Wakanda?")
-        print(f"AI Response 4: {response4}\n")
-
-        # Test Case 5: Unsupported variable (error handling)
-        print("--- Test Case 5: Unsupported Variable ---")
-        response5 = await get_ai_response("How many dogs live in California?")
-        print(f"AI Response 5: {response5}\n")
-
-    asyncio.run(main_test())
