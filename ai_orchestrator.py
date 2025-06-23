@@ -12,7 +12,10 @@ load_dotenv()
 
 api_key = os.getenv("GOOGLE_API_KEY")
 if not api_key:
-    raise ValueError("GOOGLE_API_KEY not found in .env file. Please add it.")
+    print("WARNING: GOOGLE_API_KEY not found in environment variables.")
+    print("The application will not work properly without this API key.")
+    # For development/debugging, you might want to continue, but for production this should fail
+    raise ValueError("GOOGLE_API_KEY not found in environment variables. Please add it.")
 genai.configure(api_key=api_key)
 
 # --- Dynamic Tool Schema Generation for get_demographic_data ---

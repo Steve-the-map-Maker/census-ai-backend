@@ -9,19 +9,23 @@ load_dotenv()
 app = FastAPI()
 
 # CORS middleware configuration
-origins = [
-    "http://localhost:5173",  # Default Vite frontend URL
-    "http://127.0.0.1:5173", # Also common for Vite
-    "https://census-ai-frontend.onrender.com",  # Production frontend URL
-    # Add any other origins if your frontend is served from a different port/domain
-]
+# For debugging - allowing all origins temporarily
+origins = ["*"]
+
+# Production origins (uncomment when debugging is done):
+# origins = [
+#     "http://localhost:5173",  # Default Vite frontend URL
+#     "http://127.0.0.1:5173", # Also common for Vite
+#     "https://census-ai-frontend.onrender.com",  # Production frontend URL
+# ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_credentials=False,  # Set to False when using "*" for origins
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 @app.get("/")
@@ -53,5 +57,10 @@ async def ask_ai(query_data: dict):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error processing your request with the AI: {str(e)}")
+
+@app.options("/ask_ai")
+async def ask_ai_options():
+    """Handle CORS preflight requests"""
+    return {"message": "OK"}
 
 
