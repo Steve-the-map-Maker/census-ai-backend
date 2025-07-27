@@ -4,25 +4,30 @@ import os
 from dotenv import load_dotenv
 import ai_orchestrator # Import the new AI orchestrator - back to absolute since main.py is at package root
 
-load_dotenv()
+# Determine the environment and load the appropriate .env file
+env = os.getenv("ENVIRONMENT", "development")
+
+if env == "development":
+    # For local development, load variables from .env.development
+    load_dotenv(dotenv_path=".env.development")
+    origins = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ]
+else:
+    # For production, variables are loaded from the hosting environment (Render)
+    load_dotenv()  # Load default .env if it exists
+    origins = [
+        "https://census-ai-frontend.onrender.com"
+    ]
 
 app = FastAPI()
 
 # CORS middleware configuration
-# For debugging - allowing all origins temporarily
-origins = ["*"]
-
-# Production origins (uncomment when debugging is done):
-# origins = [
-#     "http://localhost:5173",  # Default Vite frontend URL
-#     "http://127.0.0.1:5173", # Also common for Vite
-#     "https://census-ai-frontend.onrender.com",  # Production frontend URL
-# ]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_credentials=False,  # Set to False when using "*" for origins
+    allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
