@@ -326,9 +326,15 @@ Provide insights as a JSON array of strings, for example: ["Insight 1 here", "In
                                     matches = re.findall(bullet_pattern, insights_text)
                                     insights = [match.strip() for match in matches if match.strip()]
                                 
-                                # Also use the response text as summary if it's descriptive
-                                if len(insights_text) > 50 and not insights_text.startswith('['):
-                                    summary_text = insights_text[:200] + "..." if len(insights_text) > 200 else insights_text
+                                # Extract clean summary text (remove JSON parts and clean up)
+                                clean_text = re.sub(r'\[.*?\]', '', insights_text, flags=re.DOTALL)  # Remove JSON arrays
+                                clean_text = re.sub(r'^```.*?```', '', clean_text, flags=re.DOTALL | re.MULTILINE)  # Remove code blocks
+                                clean_text = re.sub(r'json\s*', '', clean_text, flags=re.IGNORECASE)  # Remove "json" keywords
+                                clean_text = clean_text.strip()
+                                
+                                # Use cleaned text as summary if it's descriptive and doesn't look like JSON
+                                if len(clean_text) > 50 and not clean_text.startswith('[') and not clean_text.startswith('{'):
+                                    summary_text = clean_text[:300] + "..." if len(clean_text) > 300 else clean_text
                                     
                             except Exception as e:
                                 print(f"Error generating insights: {e}")
