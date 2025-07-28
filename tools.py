@@ -171,3 +171,50 @@ async def get_demographic_data(
     except Exception as e:
         return {"error": f"Error calling Census API: {str(e)}"}
 
+
+def calculate_summary_statistics(data: list[dict], variable_id: str) -> dict | None:
+    """Calculates summary stats for a given variable in the dataset."""
+    # Extract valid, numeric values, handling None and non-numeric types
+    values = []
+    for row in data:
+        if variable_id in row and row[variable_id] is not None:
+            try:
+                # Handle string representations of numbers
+                if isinstance(row[variable_id], str):
+                    if row[variable_id].replace('.', '', 1).replace('-', '', 1).isdigit():
+                        values.append(float(row[variable_id]))
+                elif isinstance(row[variable_id], (int, float)):
+                    values.append(float(row[variable_id]))
+            except (ValueError, TypeError):
+                # Skip invalid values
+                continue
+    
+    if not values:
+        return None
+    
+    # Calculate stats
+    import statistics
+    mean = statistics.mean(values)
+    median = statistics.median(values)
+    min_val = min(values)
+    max_val = max(values)
+    count = len(values)
+    
+    # Find entities with min/max values
+    min_entity = next((item.get('NAME', 'N/A') for item in data 
+                      if variable_id in item and item[variable_id] is not None 
+                      and float(str(item[variable_id]).replace('-', '', 1)) == min_val), 'N/A')
+    max_entity = next((item.get('NAME', 'N/A') for item in data 
+                      if variable_id in item and item[variable_id] is not None 
+                      and float(str(item[variable_id]).replace('-', '', 1)) == max_val), 'N/A')
+
+    return {
+        "mean": round(mean, 2),
+        "median": round(median, 2), 
+        "min": round(min_val, 2),
+        "max": round(max_val, 2), 
+        "count": count,
+        "min_entity_name": min_entity,
+        "max_entity_name": max_entity
+    }
+

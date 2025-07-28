@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 import asyncio
 
 # Import the new tool and config for schema generation
-from tools import get_demographic_data # TEMP: absolute import for testing
+from tools import get_demographic_data, calculate_summary_statistics # TEMP: absolute import for testing
 from config import CENSUS_VARIABLE_MAP, GEOGRAPHY_HIERARCHY, DERIVED_METRICS_MAP # TEMP: absolute import for testing
 
 load_dotenv()
@@ -191,9 +191,9 @@ The tool will provide data that gets automatically converted into interactive ma
                     
                     print(f"Tool '{function_name}' executed. Result type: {type(tool_execution_result)}, Result: {tool_execution_result}")
                     
-                    # Phase 3: Check if this is a map request and we have valid data
+                    # Phase 7: Check if this is a map/dashboard request and we have valid data
                     if is_map_request and function_name == "get_demographic_data" and isinstance(tool_execution_result, list) and tool_execution_result:
-                        print("Map request detected with valid data, creating structured response")
+                        print("Dashboard request detected with valid data, creating structured response")
                         # tool_execution_result is already a list of data items
                         data_items = tool_execution_result
                         
@@ -241,39 +241,127 @@ The tool will provide data that gets automatically converted into interactive ma
                         print(f"Found display_variable_id: {display_variable_id}")
                         
                         if display_variable_id:
-                            # Return structured map response - ensure all data is JSON serializable
+                            # === Phase 7: Create Dashboard Data Response ===
+                            
+                            # 1. Get all variables present in the data
+                            all_variables = []
+                            for key in sample_item.keys():
+                                if key not in ['state', 'county', 'tract', 'place', 'zip code tabulation area', 'NAME']:
+                                    if key in variable_labels:
+                                        all_variables.append({"id": key, "name": variable_labels[key]})
+                            
+                            # 2. Calculate summary statistics for all numeric variables
+                            summary_statistics = {}
+                            for var_info in all_variables:
+                                var_id = var_info["id"]
+                                stats = calculate_summary_statistics(data_items, var_id)
+                                if stats:
+                                    summary_statistics[var_id] = stats
+                            
+                            # 3. Prepare chart data (Top 5 entities by display variable)
+                            chart_data = []
+                            if display_variable_id in [item["id"] for item in all_variables]:
+                                # Sort by display variable and get top 5
+                                sorted_data = sorted(data_items, 
+                                                   key=lambda x: float(x.get(display_variable_id, 0) or 0), 
+                                                   reverse=True)[:5]
+                                chart_data = [
+                                    {"name": item.get("NAME", "Unknown"), "value": float(item.get(display_variable_id, 0) or 0)}
+                                    for item in sorted_data
+                                ]
+                            
+                            charts = [{
+                                "chart_type": "bar_chart",
+                                "title": f"Top 5 {args.get('geography_level', 'entities').title()} by {variable_labels.get(display_variable_id, display_variable_id)}",
+                                "variable_id": display_variable_id,
+                                "data": chart_data
+                            }] if chart_data else []
+                            
+                            # 4. Generate AI insights using a follow-up LLM call
+                            insights_prompt = f"""Based on the following demographic data analysis, generate 2-3 concise bullet-point insights:
+
+Data Summary:
+- Geography Level: {args.get('geography_level', 'unknown')}
+- Primary Variable: {variable_labels.get(display_variable_id, display_variable_id)}
+- Number of Entities: {len(data_items)}
+
+Statistics for {variable_labels.get(display_variable_id, display_variable_id)}:
+- Mean: {summary_statistics.get(display_variable_id, {}).get('mean', 'N/A')}
+- Median: {summary_statistics.get(display_variable_id, {}).get('median', 'N/A')}
+- Range: {summary_statistics.get(display_variable_id, {}).get('min', 'N/A')} to {summary_statistics.get(display_variable_id, {}).get('max', 'N/A')}
+- Highest: {summary_statistics.get(display_variable_id, {}).get('max_entity_name', 'N/A')}
+- Lowest: {summary_statistics.get(display_variable_id, {}).get('min_entity_name', 'N/A')}
+
+Chart shows: Top 5 entities with highest values
+
+Provide insights as a JSON array of strings, for example: ["Insight 1 here", "Insight 2 here"]"""
+
+                            # Make follow-up call to LLM for insights
+                            insights = []
+                            summary_text = f"Analysis of {variable_labels.get(display_variable_id, display_variable_id)} across {len(data_items)} {args.get('geography_level', 'entities')}."
+                            
+                            try:
+                                insights_response = await current_chat_session.send_message_async(insights_prompt)
+                                if insights_response.usage_metadata:
+                                    total_prompt_tokens += insights_response.usage_metadata.prompt_token_count
+                                    total_completion_tokens += insights_response.usage_metadata.candidates_token_count
+                                
+                                # Try to parse insights from response
+                                insights_text = insights_response.text
+                                # Extract insights - look for JSON array or bullet points
+                                import re
+                                import json
+                                
+                                # Try to find JSON array first
+                                json_match = re.search(r'\[.*?\]', insights_text, re.DOTALL)
+                                if json_match:
+                                    try:
+                                        insights = json.loads(json_match.group())
+                                    except:
+                                        pass
+                                
+                                # Fallback: extract bullet points or numbered items
+                                if not insights:
+                                    bullet_pattern = r'(?:[-•*]|\d+\.)\s*(.+?)(?=\n|$)'
+                                    matches = re.findall(bullet_pattern, insights_text)
+                                    insights = [match.strip() for match in matches if match.strip()]
+                                
+                                # Also use the response text as summary if it's descriptive
+                                if len(insights_text) > 50 and not insights_text.startswith('['):
+                                    summary_text = insights_text[:200] + "..." if len(insights_text) > 200 else insights_text
+                                    
+                            except Exception as e:
+                                print(f"Error generating insights: {e}")
+                                insights = [f"Analysis of {len(data_items)} {args.get('geography_level', 'entities')} showing {variable_labels.get(display_variable_id, display_variable_id)}"]
+                            
+                            # 5. Ensure data is JSON serializable
                             import json
                             try:
                                 serializable_data = json.loads(json.dumps(data_items))
                             except:
                                 serializable_data = data_items  # fallback
                             
-                            # Create summary based on what type of variable is being displayed
-                            if display_variable_id in DERIVED_METRICS_MAP:
-                                summary = f"Map showing {DERIVED_METRICS_MAP[display_variable_id]['name']} at {args.get('geography_level', 'unknown')} level"
-                            else:
-                                var_name = variable_labels.get(display_variable_id, display_variable_id)
-                                summary = f"Map showing {var_name} at {args.get('geography_level', 'unknown')} level"
-                            
+                            # 6. Construct dashboard response
                             response = {
-                                "type": "map",
+                                "type": "dashboard_data",
+                                "summary_text": summary_text,
                                 "data": serializable_data,
                                 "metadata": {
                                     "geography_level": str(args.get("geography_level", "")),
                                     "display_variable_id": str(display_variable_id),
                                     "variable_labels": variable_labels,
-                                    "variables": list(args.get("variables", [])),
-                                    "derived_metrics": list(args.get("derived_metrics", [])),
-                                    "state_name": str(args.get("state_name")) if args.get("state_name") else None
+                                    "available_variables": all_variables
                                 },
-                                "summary": summary,
+                                "charts": charts,
+                                "summary_statistics": summary_statistics,
+                                "insights": insights,
                                 "token_usage": {
                                     "prompt_tokens": total_prompt_tokens,
                                     "completion_tokens": total_completion_tokens,
                                     "total_tokens": total_prompt_tokens + total_completion_tokens
                                 }
                             }
-                            print(f"Returning map response: {response}")
+                            print(f"Returning dashboard response")
                             return response
 
                     # Construct the function response as a dictionary for the LLM

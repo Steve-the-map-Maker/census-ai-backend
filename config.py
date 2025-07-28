@@ -89,5 +89,20 @@ DERIVED_METRICS_MAP = {
         "name": "Owner-Occupied Housing Rate (%)",
         "required_variables": ["owner_occupied_housing_units", "total_housing_units"],
         "calculation": lambda row, labels: (float(row.get(labels["owner_occupied_housing_units"], 0)) / float(row.get(labels["total_housing_units"], 1))) * 100 if float(row.get(labels["total_housing_units"], 1)) > 0 else 0
+    },
+    "poverty_percentage": {
+        "name": "Poverty Rate (%)",
+        "required_variables": ["population_in_poverty", "total_population"],
+        "calculation": lambda row, labels: (float(row.get(labels["population_in_poverty"], 0)) / float(row.get(labels["total_population"], 1))) * 100 if float(row.get(labels["total_population"], 1)) > 0 else 0
+    },
+    "bachelors_degree_percentage": {
+        "name": "Population with Bachelor's Degree or Higher (%)",
+        "required_variables": ["population_with_bachelors_degree_or_higher", "total_population"],
+        "calculation": lambda row, labels: (float(row.get(labels["population_with_bachelors_degree_or_higher"], 0)) / float(row.get(labels["total_population"], 1))) * 100 if float(row.get(labels["total_population"], 1)) > 0 else 0
+    },
+    "housing_vacancy_rate": {
+        "name": "Housing Vacancy Rate (%)",
+        "required_variables": ["total_housing_units", "owner_occupied_housing_units", "renter_occupied_housing_units"],
+        "calculation": lambda row, labels: ((float(row.get(labels["total_housing_units"], 0)) - float(row.get(labels["owner_occupied_housing_units"], 0)) - float(row.get(labels["renter_occupied_housing_units"], 0))) / float(row.get(labels["total_housing_units"], 1))) * 100 if float(row.get(labels["total_housing_units"], 1)) > 0 else 0
     }
 }
