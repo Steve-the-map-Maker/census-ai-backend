@@ -7,19 +7,30 @@ import ai_orchestrator # Import the new AI orchestrator - back to absolute since
 # Determine the environment and load the appropriate .env file
 env = os.getenv("ENVIRONMENT", "development")
 
-if env == "development":
+# Debug logging to see what environment we're in
+print(f"Environment detected: {env}")
+print(f"Available env vars: RENDER={os.getenv('RENDER')}, RENDER_SERVICE_NAME={os.getenv('RENDER_SERVICE_NAME')}")
+
+# Check if we're on Render (production) by checking for Render-specific environment variables
+is_production = os.getenv("RENDER") or os.getenv("RENDER_SERVICE_NAME") or env == "production"
+
+if is_production:
+    # For production, variables are loaded from the hosting environment (Render)
+    print("Running in PRODUCTION mode")
+    origins = [
+        "https://census-ai-frontend.onrender.com",
+        "https://census-ai-frontend.onrender.com/",  # Include trailing slash variant
+    ]
+else:
     # For local development, load variables from .env.development
+    print("Running in DEVELOPMENT mode")
     load_dotenv(dotenv_path=".env.development")
     origins = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ]
-else:
-    # For production, variables are loaded from the hosting environment (Render)
-    load_dotenv()  # Load default .env if it exists
-    origins = [
-        "https://census-ai-frontend.onrender.com"
-    ]
+
+print(f"CORS Origins configured: {origins}")
 
 app = FastAPI()
 
@@ -29,9 +40,18 @@ app.add_middleware(
     allow_origins=origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
+    allow_headers=[
+        "Accept",
+        "Accept-Language",
+        "Content-Language",
+        "Content-Type",
+        "Authorization",
+        "X-Requested-With",
+    ],
     expose_headers=["*"],
 )
+
+print("CORS middleware configured successfully")
 
 @app.get("/")
 async def read_root():
