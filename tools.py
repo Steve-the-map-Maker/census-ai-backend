@@ -93,6 +93,14 @@ async def get_demographic_data(
             unknown_vars.append(var_name)
             print(f"Unknown variable: '{var_name}'")
 
+    # Always include NAME to get geographic entity names for charts and labels
+    print(f"Before adding NAME: census_vars = {census_vars}")
+    if "NAME" not in census_vars:
+        census_vars.append("NAME")
+        print("Added NAME variable for geographic entity labels")
+    else:
+        print("NAME already in census_vars")
+    
     print(f"Final census_vars: {census_vars}")
     print(f"Unknown vars: {unknown_vars}")
     
