@@ -4,15 +4,17 @@ import os
 from dotenv import load_dotenv
 import ai_orchestrator # Import the new AI orchestrator - back to absolute since main.py is at package root
 
-# Determine the environment and load the appropriate .env file
+# Determine the environment - check for any production indicators
 env = os.getenv("ENVIRONMENT", "development")
+render_vars = os.getenv("RENDER") or os.getenv("RENDER_SERVICE_NAME") or os.getenv("RENDER_SERVICE_ID") or os.getenv("RENDER_EXTERNAL_HOSTNAME")
 
 # Debug logging to see what environment we're in
 print(f"Environment detected: {env}")
-print(f"Available env vars: RENDER={os.getenv('RENDER')}, RENDER_SERVICE_NAME={os.getenv('RENDER_SERVICE_NAME')}")
+print(f"Render vars: RENDER={os.getenv('RENDER')}, RENDER_SERVICE_NAME={os.getenv('RENDER_SERVICE_NAME')}")
+print(f"RENDER_SERVICE_ID={os.getenv('RENDER_SERVICE_ID')}, RENDER_EXTERNAL_HOSTNAME={os.getenv('RENDER_EXTERNAL_HOSTNAME')}")
 
-# Check if we're on Render (production) by checking for Render-specific environment variables
-is_production = os.getenv("RENDER") or os.getenv("RENDER_SERVICE_NAME") or env == "production"
+# Check if we're on Render (production) - be more aggressive about detecting production
+is_production = render_vars or env == "production" or "render.com" in str(os.getenv("RENDER_EXTERNAL_HOSTNAME", ""))
 
 if is_production:
     # For production, variables are loaded from the hosting environment (Render)
@@ -20,6 +22,7 @@ if is_production:
     origins = [
         "https://census-ai-frontend.onrender.com",
         "https://census-ai-frontend.onrender.com/",  # Include trailing slash variant
+        "*"  # Temporary wildcard for debugging
     ]
 else:
     # For local development, load variables from .env.development
@@ -29,25 +32,19 @@ else:
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ]
+    ]
 
 print(f"CORS Origins configured: {origins}")
 
 app = FastAPI()
 
-# CORS middleware configuration
+# CORS middleware configuration - more permissive for production debugging
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=[
-        "Accept",
-        "Accept-Language",
-        "Content-Language",
-        "Content-Type",
-        "Authorization",
-        "X-Requested-With",
-    ],
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
     expose_headers=["*"],
 )
 
