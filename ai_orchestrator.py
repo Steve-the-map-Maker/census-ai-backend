@@ -1,12 +1,19 @@
 import os
+import json
 import asyncio
 from typing import Any, Dict, List, Tuple
+
+from proto.marshal.collections.repeated import RepeatedComposite
 
 import google.generativeai as genai
 from dotenv import load_dotenv
 
 from llm_config import CENSUS_TOOL, SYSTEM_INSTRUCTION, get_variable_labels
-from tools import get_demographic_data, calculate_summary_statistics  # TEMP: absolute import for testing
+from tools import (
+    get_demographic_data,
+    get_demographic_time_series,
+    calculate_summary_statistics,
+)  # TEMP: absolute import for testing
 
 load_dotenv()
 
@@ -25,12 +32,31 @@ model = genai.GenerativeModel(
 )
 
 AVAILABLE_FUNCTIONS = {
-    "get_demographic_data": get_demographic_data
+    "get_demographic_data": get_demographic_data,
+    "get_demographic_time_series": get_demographic_time_series,
 }
 
 DEFAULT_HISTORY_LIMIT = int(os.getenv("LLM_HISTORY_LIMIT", "6"))
 NON_VALUE_KEYS = {"state", "county", "tract", "place", "zip code tabulation area"}
 MAP_TOOL_HINT = "Hint: Use the get_demographic_data tool when answering geographic visualization questions."
+TIME_SERIES_TOOL_HINT = "Hint: Use the get_demographic_time_series tool when users ask about change over time or trends."
+
+
+def _normalize_tool_value(value: Any) -> Any:
+    """Convert protobuf marshalled values into plain Python types for tool execution."""
+    if isinstance(value, RepeatedComposite):
+        return [_normalize_tool_value(item) for item in list(value)]
+    if isinstance(value, dict):
+        return {key: _normalize_tool_value(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_tool_value(item) for item in value]
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return value
+
+
+def _normalize_tool_args(raw_args: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: _normalize_tool_value(value) for key, value in raw_args.items()}
 
 
 def truncate_history(history: List[Dict[str, Any]] | None, max_messages: int = DEFAULT_HISTORY_LIMIT) -> List[Dict[str, Any]]:
@@ -40,11 +66,42 @@ def truncate_history(history: List[Dict[str, Any]] | None, max_messages: int = D
     return history[-max_messages:]
 
 
-def build_query_prompt(user_query: str, is_map_request: bool) -> str:
-    """Append a lightweight hint for map requests without duplicating the system prompt."""
+def build_query_prompt(user_query: str, is_map_request: bool, is_time_series_request: bool) -> str:
+    """Append lightweight hints for map or time-series requests without duplicating the system prompt."""
+    hints: List[str] = []
     if is_map_request:
-        return f"{user_query}\n\n{MAP_TOOL_HINT}"
+        hints.append(MAP_TOOL_HINT)
+    if is_time_series_request:
+        hints.append(TIME_SERIES_TOOL_HINT)
+    if hints:
+        return f"{user_query}\n\n" + "\n".join(hints)
     return user_query
+
+
+def detect_time_series_request(user_query: str) -> bool:
+    """Heuristically determine if the query is asking about change over time or trends."""
+    query_lower = user_query.lower()
+    time_keywords = [
+        "over time",
+        "time series",
+        "trend",
+        "since ",
+        "year over year",
+        "year-by-year",
+        "historical",
+        "change from",
+        "changes from",
+        "growth from",
+        "growth since",
+        "timeline",
+    ]
+    if any(keyword in query_lower for keyword in time_keywords):
+        return True
+
+    # Look for multiple year references (e.g., 2010 and 2020) to infer a range
+    years_found = [token for token in query_lower.split() if token.isdigit() and len(token) == 4]
+    unique_years = {year for year in years_found if year.startswith("19") or year.startswith("20")}
+    return len(unique_years) >= 2
 
 
 def summarize_tool_result(data: Any, args: Dict[str, Any], top_n: int = 5) -> Dict[str, Any]:
@@ -139,6 +196,174 @@ def generate_basic_insights(data: List[Dict[str, Any]], variable_id: str, variab
 
     return insights
 
+
+def build_time_series_dashboard(
+    tool_result: Dict[str, Any],
+    args: Dict[str, Any],
+    total_prompt_tokens: int,
+    total_completion_tokens: int,
+) -> Dict[str, Any]:
+    if not isinstance(tool_result, dict):
+        return {
+            "response": "Sorry, the time-series tool did not return structured data.",
+            "token_usage": {
+                "prompt_tokens": total_prompt_tokens,
+                "completion_tokens": total_completion_tokens,
+                "total_tokens": total_prompt_tokens + total_completion_tokens,
+            },
+        }
+
+    if "error" in tool_result:
+        return {
+            "response": tool_result.get("error", "Time-series tool reported an error."),
+            "token_usage": {
+                "prompt_tokens": total_prompt_tokens,
+                "completion_tokens": total_completion_tokens,
+                "total_tokens": total_prompt_tokens + total_completion_tokens,
+            },
+        }
+
+    data = tool_result.get("data", [])
+    metadata = dict(tool_result.get("metadata", {}))
+    series = tool_result.get("series", [])
+    metrics = tool_result.get("metrics", {})
+
+    variable_labels = get_variable_labels()
+    primary_code = metadata.get("primary_variable_code")
+
+    fallback_label = None
+    requested_variables = args.get("variables") or []
+    if requested_variables:
+        fallback_label = variable_labels.get(requested_variables[0], requested_variables[0])
+    elif args.get("derived_metrics"):
+        fallback_label = variable_labels.get(args["derived_metrics"][0], args["derived_metrics"][0])
+
+    variable_label = variable_labels.get(primary_code, fallback_label or primary_code or "Value")
+
+    variable_code_map = metadata.get("variable_codes", {})
+
+    label_keys: List[str] = []
+    for user_var in requested_variables:
+        label_keys.append(user_var)
+        code = variable_code_map.get(user_var)
+        if code:
+            label_keys.append(code)
+    for metric_key in args.get("derived_metrics") or []:
+        label_keys.append(metric_key)
+    if primary_code:
+        label_keys.append(primary_code)
+
+    metadata_labels: Dict[str, str] = metadata.get("variable_labels", {}) or {}
+    for key in label_keys:
+        if not key:
+            continue
+        if key not in metadata_labels:
+            label_value = variable_labels.get(key)
+            if not label_value and isinstance(key, str):
+                label_value = key.replace("_", " ").title()
+            metadata_labels[key] = label_value or str(key)
+
+    metadata.setdefault("primary_variable_code", primary_code)
+    metadata["primary_variable_label"] = metadata_labels.get(primary_code, variable_label)
+    metadata["variable_labels"] = metadata_labels
+
+    insights: List[str] = []
+    if data and primary_code:
+        latest_year = metadata.get("end_year")
+        latest_rows = [row for row in data if latest_year is not None and row.get("year") == latest_year]
+        baseline_rows = latest_rows or data
+        insights = generate_basic_insights(baseline_rows, primary_code, variable_label)
+
+    largest_increase = metrics.get("largest_increase") or {}
+    if largest_increase.get("metrics"):
+        change_value = largest_increase["metrics"].get("absolute_change")
+        insights.append(
+            f"{largest_increase.get('NAME', 'This geography')} shows the largest change at {_format_value(change_value)} between {metadata.get('start_year')} and {metadata.get('end_year')}."
+        )
+
+    fastest_growth = metrics.get("fastest_growth") or {}
+    if fastest_growth.get("metrics") and fastest_growth["metrics"].get("percent_change") is not None:
+        percent_change = fastest_growth["metrics"].get("percent_change")
+        insights.append(
+            f"Fastest growth occurs in {fastest_growth.get('NAME', 'this geography')} at {percent_change:.1f}% over the period."
+        )
+
+    def _series_sort_key(entry: Dict[str, Any]) -> float:
+        metrics_block = entry.get("metrics", {})
+        end_value = metrics_block.get("end_value")
+        if end_value is None:
+            return float("-inf")
+        try:
+            return float(end_value)
+        except (TypeError, ValueError):
+            return float("-inf")
+
+    top_series = sorted(series, key=_series_sort_key, reverse=True)[:10]
+
+    chart_series = []
+    for entry in top_series:
+        values = [
+            {"year": point.get("year"), "value": point.get("value")}
+            for point in entry.get("values", [])
+        ]
+        chart_series.append(
+            {
+                "geography_id": entry.get("geography_id"),
+                "name": entry.get("NAME", entry.get("geography_id")),
+                "values": values,
+            }
+        )
+
+    charts = []
+    if chart_series:
+        charts.append(
+            {
+                "chart_type": "line_chart",
+                "title": f"{variable_label} ({metadata.get('start_year')}–{metadata.get('end_year')})",
+                "series": chart_series,
+            }
+        )
+
+    summary_text = (
+        f"Time-series analysis of {variable_label} across {metadata.get('series_count', len(series))} "
+        f"{metadata.get('geography_level', 'regions')} from {metadata.get('start_year')} to {metadata.get('end_year')}."
+    )
+
+    errors = tool_result.get("errors", {})
+
+    try:
+        serializable_data = json.loads(json.dumps({
+            "data": data,
+            "series": series,
+            "metadata": metadata,
+            "metrics": metrics,
+            "errors": errors,
+        }))
+    except TypeError:
+        serializable_data = {
+            "data": data,
+            "series": series,
+            "metadata": metadata,
+            "metrics": metrics,
+            "errors": errors,
+        }
+
+    return {
+        "type": "time_series_dashboard",
+        "summary_text": summary_text,
+        "data": serializable_data.get("data", data),
+        "series": serializable_data.get("series", series),
+        "charts": charts,
+        "metrics": serializable_data.get("metrics", metrics),
+        "metadata": serializable_data.get("metadata", metadata),
+        "errors": serializable_data.get("errors", errors),
+        "insights": insights,
+        "token_usage": {
+            "prompt_tokens": total_prompt_tokens,
+            "completion_tokens": total_completion_tokens,
+            "total_tokens": total_prompt_tokens + total_completion_tokens,
+        },
+    }
 async def get_ai_response(user_query: str, chat_history: list = None) -> dict:
     """
     Generates a response from the Gemini Pro model, potentially using tools.
@@ -155,14 +380,19 @@ async def get_ai_response(user_query: str, chat_history: list = None) -> dict:
     
     try:
         map_keywords = ['map', 'show me', 'display', 'visualize', 'chart', 'counties', 'states', 'income', 'population', 'demographic']
-        is_map_request = any(keyword in user_query.lower() for keyword in map_keywords)
+        lower_query = user_query.lower()
+        is_map_request = any(keyword in lower_query for keyword in map_keywords)
+        is_time_series_request = detect_time_series_request(user_query)
 
         trimmed_history = truncate_history(chat_history)
         current_chat_session = model.start_chat(history=trimmed_history)
 
-        query_for_llm = build_query_prompt(user_query, is_map_request)
+        query_for_llm = build_query_prompt(user_query, is_map_request, is_time_series_request)
 
-        print(f"\nSending to Gemini (1st call): Query: '{user_query}' (Map request: {is_map_request})")
+        print(
+            f"\nSending to Gemini (1st call): Query: '{user_query}' "
+            f"(Map request: {is_map_request}, Time-series: {is_time_series_request})"
+        )
         response = await current_chat_session.send_message_async(query_for_llm)
         
         # Track token usage from first LLM call
@@ -186,7 +416,7 @@ async def get_ai_response(user_query: str, chat_history: list = None) -> dict:
         if hasattr(response_part, 'function_call') and response_part.function_call:
             function_call = response_part.function_call
             function_name = function_call.name
-            args = dict(function_call.args)
+            args = _normalize_tool_args(dict(function_call.args))
 
             print(f"Gemini wants to call function: {function_name} with args: {args}")
 
@@ -194,6 +424,8 @@ async def get_ai_response(user_query: str, chat_history: list = None) -> dict:
                 actual_function = AVAILABLE_FUNCTIONS[function_name]
                 function_response_content_for_llm = None # Renamed for clarity
                 try:
+                    debug_arg_types = {key: str(type(value)) for key, value in args.items()}
+                    print(f"Function call argument types: {debug_arg_types}")
                     print(f"Executing tool: {function_name}")
                     if asyncio.iscoroutinefunction(actual_function):
                         tool_execution_result = await actual_function(**args)
@@ -203,6 +435,14 @@ async def get_ai_response(user_query: str, chat_history: list = None) -> dict:
                     
                     record_count = len(tool_execution_result) if isinstance(tool_execution_result, list) else 'n/a'
                     print(f"Tool '{function_name}' executed. Result type: {type(tool_execution_result)}, records: {record_count}")
+                    if function_name == "get_demographic_time_series":
+                        print("Time-series response detected, constructing dashboard output.")
+                        return build_time_series_dashboard(
+                            tool_execution_result,
+                            args,
+                            total_prompt_tokens,
+                            total_completion_tokens,
+                        )
                     
                     # Phase 7: Check if this is a map/dashboard request and we have valid data
                     if is_map_request and function_name == "get_demographic_data" and isinstance(tool_execution_result, list) and tool_execution_result:
@@ -223,9 +463,23 @@ async def get_ai_response(user_query: str, chat_history: list = None) -> dict:
                             for metric in requested_derived_metrics:
                                 if metric in sample_item:
                                     display_variable_id = metric
-                                    break
+                                    if isinstance(tool_execution_result, list):
+                                        record_count = len(tool_execution_result)
+                                    elif isinstance(tool_execution_result, dict):
+                                        record_count = len(tool_execution_result.get("data", []))
+                                    else:
+                                        record_count = 'n/a'
                         
                         # If no derived metrics, find the first regular variable
+                                    if function_name == "get_demographic_time_series" and isinstance(tool_execution_result, dict):
+                                        print("Time-series request detected, creating structured time-series dashboard response")
+                                        return build_time_series_dashboard(
+                                            tool_execution_result,
+                                            args,
+                                            total_prompt_tokens,
+                                            total_completion_tokens,
+                                        )
+
                         if not display_variable_id:
                             requested_variables = args.get("variables", [])
                             for var in requested_variables:
@@ -329,7 +583,9 @@ async def get_ai_response(user_query: str, chat_history: list = None) -> dict:
                     ]
 
                 except Exception as e:
+                    import traceback
                     print(f"Error executing function {function_name}: {e}")
+                    traceback.print_exc()
                     function_response_content_for_llm = [
                         {
                             "function_response": {
