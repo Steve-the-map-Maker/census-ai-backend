@@ -1,12 +1,12 @@
 import os
-import google.generativeai as genai
-from google.generativeai.types import FunctionDeclaration, Tool 
-from dotenv import load_dotenv
 import asyncio
+from typing import Any, Dict, List, Tuple
 
-# Import the new tool and config for schema generation
-from tools import get_demographic_data, calculate_summary_statistics # TEMP: absolute import for testing
-from config import CENSUS_VARIABLE_MAP, GEOGRAPHY_HIERARCHY, DERIVED_METRICS_MAP # TEMP: absolute import for testing
+import google.generativeai as genai
+from dotenv import load_dotenv
+
+from llm_config import CENSUS_TOOL, SYSTEM_INSTRUCTION, get_variable_labels
+from tools import get_demographic_data, calculate_summary_statistics  # TEMP: absolute import for testing
 
 load_dotenv()
 
@@ -18,96 +18,126 @@ if not api_key:
     raise ValueError("GOOGLE_API_KEY not found in environment variables. Please add it.")
 genai.configure(api_key=api_key)
 
-# --- Dynamic Tool Schema Generation for get_demographic_data ---
-def create_get_demographic_data_tool():
-    user_friendly_variable_names = list(CENSUS_VARIABLE_MAP.keys())
-    geography_level_names = list(GEOGRAPHY_HIERARCHY.keys())
-    derived_metric_names = list(DERIVED_METRICS_MAP.keys())
-
-    get_demographic_data_declaration = FunctionDeclaration(
-        name="get_demographic_data",
-        description="""Fetches demographic data from the US Census Bureau for data visualization and interactive maps. 
-
-ALWAYS use this tool when users ask for:
-- Maps (e.g., "map of population by state", "show me a map", "map median income")
-- Charts or visualizations of demographic data
-- County-level data for any state
-- State-level data across the US
-- Any demographic statistics (population, income, age, housing, etc.)
-- Comparative queries (e.g., "Which states have more men than women?", "States with highest unemployment")
-
-For MAP REQUESTS:
-- Use geography_level="state" for US-wide state maps
-- Use geography_level="county" for county maps within a state (requires state_name)
-- The system will automatically create interactive choropleth maps
-
-For COMPARATIVE QUERIES:
-- Use derived_metrics for calculated comparisons (e.g., male_female_difference, unemployment_percentage)
-- Derived metrics automatically compute differences, ratios, and percentages
-
-For COUNTY REQUESTS: Always include the state_name parameter (e.g., "California", "Texas", "New York")""",
-        parameters={
-            "type": "object",
-            "properties": {
-                "geography_level": {
-                    "type": "string",
-                    "description": "The target geographic level.",
-                    "enum": geography_level_names,
-                },
-                "variables": {
-                    "type": "array",
-                    "description": "A list of user-friendly variable names to retrieve.",
-                    "items": {
-                        "type": "string",
-                        "enum": user_friendly_variable_names,
-                    },
-                },
-                "derived_metrics": {
-                    "type": "array",
-                    "description": "A list of derived/calculated metrics to compute (e.g., for comparisons like 'more men than women').",
-                    "items": {
-                        "type": "string",
-                        "enum": derived_metric_names,
-                    },
-                },
-                # Simplified parameter descriptions for brevity in this test
-                "state_name": {"type": "string", "description": "The name of the state (not required for state-level queries when getting all states)."},
-                "county_name": {"type": "string", "description": "The name of the county."},
-                "place_name": {"type": "string", "description": "The name of the place."},
-                "tract_code": {"type": "string", "description": "The Census tract code."},
-                "block_group_code": {"type": "string", "description": "The block group code."},
-                "zip_code_tabulation_area": {"type": "string", "description": "The 5-digit ZCTA code."},
-            },
-            "required": ["geography_level"],
-        },
-    )
-    # Ensure Tool is used correctly here
-    return Tool(function_declarations=[get_demographic_data_declaration])
-
-census_tool = create_get_demographic_data_tool()
-
 model = genai.GenerativeModel(
-    model_name='gemini-1.5-flash',
-    tools=[census_tool],
-    system_instruction="""You are a helpful assistant that provides US Census demographic data and visualizations. When users ask for maps, charts, or data visualization, always use the get_demographic_data tool to fetch the required data. 
-
-For US-wide maps, use geography_level='state'. For state-specific maps, use geography_level='county' and include the state_name parameter.
-
-For comparative queries (e.g., "Which states have more men than women?", "States with highest unemployment"), use derived_metrics without needing variables:
-- male_female_difference: Calculates difference between male and female population
-- unemployment_percentage: Calculates unemployment rate as a percentage  
-- owner_occupied_percentage: Calculates owner-occupied housing percentage
-
-You can use EITHER variables OR derived_metrics or both. The geography_level is the only required parameter.
-
-Available derived metrics: male_female_difference, unemployment_percentage, owner_occupied_percentage
-
-When users ask comparative questions, determine the appropriate derived metric and use it to create meaningful visualizations."""
+    model_name='gemini-2.5-flash',
+    tools=[CENSUS_TOOL],
+    system_instruction=SYSTEM_INSTRUCTION
 )
 
 AVAILABLE_FUNCTIONS = {
     "get_demographic_data": get_demographic_data
 }
+
+DEFAULT_HISTORY_LIMIT = int(os.getenv("LLM_HISTORY_LIMIT", "6"))
+NON_VALUE_KEYS = {"state", "county", "tract", "place", "zip code tabulation area"}
+MAP_TOOL_HINT = "Hint: Use the get_demographic_data tool when answering geographic visualization questions."
+
+
+def truncate_history(history: List[Dict[str, Any]] | None, max_messages: int = DEFAULT_HISTORY_LIMIT) -> List[Dict[str, Any]]:
+    """Return only the most recent chat messages to keep prompt size small."""
+    if not history:
+        return []
+    return history[-max_messages:]
+
+
+def build_query_prompt(user_query: str, is_map_request: bool) -> str:
+    """Append a lightweight hint for map requests without duplicating the system prompt."""
+    if is_map_request:
+        return f"{user_query}\n\n{MAP_TOOL_HINT}"
+    return user_query
+
+
+def summarize_tool_result(data: Any, args: Dict[str, Any], top_n: int = 5) -> Dict[str, Any]:
+    """Produce a compact summary of tool results for the LLM."""
+    if not isinstance(data, list) or not data:
+        return {
+            "summary": {
+                "total_records": 0,
+                "geography_level": args.get("geography_level"),
+                "variables": args.get("variables"),
+                "derived_metrics": args.get("derived_metrics"),
+            },
+            "samples": [],
+        }
+
+    fields = [str(key) for key in data[0].keys()]
+    samples: List[Dict[str, Any]] = []
+    for item in data[:top_n]:
+        sample: Dict[str, Any] = {}
+        if "NAME" in item:
+            sample["NAME"] = item["NAME"]
+        for key, value in item.items():
+            if key in NON_VALUE_KEYS or key == "NAME":
+                continue
+            if isinstance(value, (int, float, str)):
+                sample[key] = value
+        samples.append(sample)
+
+    return {
+        "summary": {
+            "total_records": len(data),
+            "geography_level": args.get("geography_level"),
+            "variables": args.get("variables"),
+            "derived_metrics": args.get("derived_metrics"),
+            "fields": fields,
+        },
+        "samples": samples,
+    }
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str) and value.strip():
+            return float(value.replace(",", ""))
+    except ValueError:
+        return None
+    return None
+
+
+def _format_value(value: float | None) -> str:
+    if value is None:
+        return "N/A"
+    if abs(value) >= 1_000_000:
+        return f"{value/1_000_000:.1f}M"
+    if abs(value) >= 1_000:
+        return f"{value/1_000:.1f}K"
+    if value.is_integer():
+        return f"{int(value)}"
+    return f"{value:.2f}"
+
+
+def generate_basic_insights(data: List[Dict[str, Any]], variable_id: str, variable_label: str) -> List[str]:
+    """Create lightweight insights without a second LLM round-trip."""
+    numeric_rows: List[Tuple[float, str]] = []
+    for row in data:
+        value = _safe_float(row.get(variable_id))
+        if value is None:
+            continue
+        numeric_rows.append((value, row.get("NAME", "Unknown")))
+
+    if not numeric_rows:
+        return []
+
+    numeric_rows.sort()
+    min_value, min_name = numeric_rows[0]
+    max_value, max_name = numeric_rows[-1]
+    mid = len(numeric_rows) // 2
+    median_value, median_name = numeric_rows[mid]
+
+    spread = max_value - min_value
+    insights = [
+        f"{max_name} reports the highest {variable_label} at {_format_value(max_value)}.",
+        f"{min_name} has the lowest {variable_label} at {_format_value(min_value)}.",
+    ]
+
+    if len(numeric_rows) > 2:
+        insights.append(
+            f"Median entity ({median_name}) sits at {_format_value(median_value)}, showing overall spread of {_format_value(spread)}."
+        )
+
+    return insights
 
 async def get_ai_response(user_query: str, chat_history: list = None) -> dict:
     """
@@ -124,34 +154,16 @@ async def get_ai_response(user_query: str, chat_history: list = None) -> dict:
     total_completion_tokens = 0
     
     try:
-        # Phase 3: Detect map requests with better keywords
         map_keywords = ['map', 'show me', 'display', 'visualize', 'chart', 'counties', 'states', 'income', 'population', 'demographic']
         is_map_request = any(keyword in user_query.lower() for keyword in map_keywords)
-        
-        current_chat_session = model.start_chat(history=chat_history or [])
-        
-        # Add system instruction for map requests
-        system_instruction = """You are a Census data visualization assistant. When users ask for maps, demographic data, or statistics about states/counties, you should ALWAYS use the get_demographic_data tool. 
 
-Examples that require the tool:
-- "Map median income for California counties" → Use get_demographic_data with geography_level="county", state_name="California", variables=["median_household_income"]
-- "Show population by state" → Use get_demographic_data with geography_level="state", variables=["total_population"]
-- "Counties in Texas" → Use get_demographic_data with geography_level="county", state_name="Texas"
-- "Which states have more men than women?" → Use get_demographic_data with geography_level="state", derived_metrics=["male_female_difference"]
-- "States with highest unemployment" → Use get_demographic_data with geography_level="state", derived_metrics=["unemployment_percentage"]
+        trimmed_history = truncate_history(chat_history)
+        current_chat_session = model.start_chat(history=trimmed_history)
 
-For comparative queries, use derived_metrics instead of or in addition to variables.
+        query_for_llm = build_query_prompt(user_query, is_map_request)
 
-The tool will provide data that gets automatically converted into interactive maps."""
-        
         print(f"\nSending to Gemini (1st call): Query: '{user_query}' (Map request: {is_map_request})")
-        
-        # For map requests, prepend instruction
-        if is_map_request:
-            enhanced_query = f"{system_instruction}\n\nUser request: {user_query}"
-            response = await current_chat_session.send_message_async(enhanced_query)
-        else:
-            response = await current_chat_session.send_message_async(user_query)
+        response = await current_chat_session.send_message_async(query_for_llm)
         
         # Track token usage from first LLM call
         if response.usage_metadata:
@@ -189,26 +201,16 @@ The tool will provide data that gets automatically converted into interactive ma
                         loop = asyncio.get_running_loop()
                         tool_execution_result = await loop.run_in_executor(None, actual_function, **args)
                     
-                    print(f"Tool '{function_name}' executed. Result type: {type(tool_execution_result)}, Result: {tool_execution_result}")
+                    record_count = len(tool_execution_result) if isinstance(tool_execution_result, list) else 'n/a'
+                    print(f"Tool '{function_name}' executed. Result type: {type(tool_execution_result)}, records: {record_count}")
                     
                     # Phase 7: Check if this is a map/dashboard request and we have valid data
                     if is_map_request and function_name == "get_demographic_data" and isinstance(tool_execution_result, list) and tool_execution_result:
                         print("Dashboard request detected with valid data, creating structured response")
                         # tool_execution_result is already a list of data items
                         data_items = tool_execution_result
-                        
-                        # Create variable labels mapping for human-readable names
-                        variable_labels = {}
-                        
-                        # Add labels for regular variables (both human-readable keys and Census codes)
-                        for var_key, census_code in CENSUS_VARIABLE_MAP.items():
-                            human_readable_name = var_key.replace("_", " ").title()
-                            variable_labels[var_key] = human_readable_name  # human-readable key -> name
-                            variable_labels[census_code] = human_readable_name  # Census code -> name
-                        
-                        # Add labels for derived metrics
-                        for metric_key, metric_info in DERIVED_METRICS_MAP.items():
-                            variable_labels[metric_key] = metric_info["name"]
+
+                        variable_labels = get_variable_labels()
                         
                         # Find the display variable - prioritize derived metrics, then regular variables
                         sample_item = data_items[0]
@@ -277,68 +279,10 @@ The tool will provide data that gets automatically converted into interactive ma
                                 "data": chart_data
                             }] if chart_data else []
                             
-                            # 4. Generate AI insights using a follow-up LLM call
-                            insights_prompt = f"""Based on the following demographic data analysis, generate 2-3 concise bullet-point insights:
-
-Data Summary:
-- Geography Level: {args.get('geography_level', 'unknown')}
-- Primary Variable: {variable_labels.get(display_variable_id, display_variable_id)}
-- Number of Entities: {len(data_items)}
-
-Statistics for {variable_labels.get(display_variable_id, display_variable_id)}:
-- Mean: {summary_statistics.get(display_variable_id, {}).get('mean', 'N/A')}
-- Median: {summary_statistics.get(display_variable_id, {}).get('median', 'N/A')}
-- Range: {summary_statistics.get(display_variable_id, {}).get('min', 'N/A')} to {summary_statistics.get(display_variable_id, {}).get('max', 'N/A')}
-- Highest: {summary_statistics.get(display_variable_id, {}).get('max_entity_name', 'N/A')}
-- Lowest: {summary_statistics.get(display_variable_id, {}).get('min_entity_name', 'N/A')}
-
-Chart shows: Top 5 entities with highest values
-
-Provide insights as a JSON array of strings, for example: ["Insight 1 here", "Insight 2 here"]"""
-
-                            # Make follow-up call to LLM for insights
-                            insights = []
-                            summary_text = f"Analysis of {variable_labels.get(display_variable_id, display_variable_id)} across {len(data_items)} {args.get('geography_level', 'entities')}."
-                            
-                            try:
-                                insights_response = await current_chat_session.send_message_async(insights_prompt)
-                                if insights_response.usage_metadata:
-                                    total_prompt_tokens += insights_response.usage_metadata.prompt_token_count
-                                    total_completion_tokens += insights_response.usage_metadata.candidates_token_count
-                                
-                                # Try to parse insights from response
-                                insights_text = insights_response.text
-                                # Extract insights - look for JSON array or bullet points
-                                import re
-                                import json
-                                
-                                # Try to find JSON array first
-                                json_match = re.search(r'\[.*?\]', insights_text, re.DOTALL)
-                                if json_match:
-                                    try:
-                                        insights = json.loads(json_match.group())
-                                    except:
-                                        pass
-                                
-                                # Fallback: extract bullet points or numbered items
-                                if not insights:
-                                    bullet_pattern = r'(?:[-•*]|\d+\.)\s*(.+?)(?=\n|$)'
-                                    matches = re.findall(bullet_pattern, insights_text)
-                                    insights = [match.strip() for match in matches if match.strip()]
-                                
-                                # Extract clean summary text (remove JSON parts and clean up)
-                                clean_text = re.sub(r'\[.*?\]', '', insights_text, flags=re.DOTALL)  # Remove JSON arrays
-                                clean_text = re.sub(r'^```.*?```', '', clean_text, flags=re.DOTALL | re.MULTILINE)  # Remove code blocks
-                                clean_text = re.sub(r'json\s*', '', clean_text, flags=re.IGNORECASE)  # Remove "json" keywords
-                                clean_text = clean_text.strip()
-                                
-                                # Use cleaned text as summary if it's descriptive and doesn't look like JSON
-                                if len(clean_text) > 50 and not clean_text.startswith('[') and not clean_text.startswith('{'):
-                                    summary_text = clean_text[:300] + "..." if len(clean_text) > 300 else clean_text
-                                    
-                            except Exception as e:
-                                print(f"Error generating insights: {e}")
-                                insights = [f"Analysis of {len(data_items)} {args.get('geography_level', 'entities')} showing {variable_labels.get(display_variable_id, display_variable_id)}"]
+                            # 4. Generate heuristic insights without extra LLM calls
+                            variable_label = variable_labels.get(display_variable_id, display_variable_id)
+                            insights = generate_basic_insights(data_items, display_variable_id, variable_label)
+                            summary_text = f"Analysis of {variable_label} across {len(data_items)} {args.get('geography_level', 'entities')}"
                             
                             # 5. Ensure data is JSON serializable
                             import json
@@ -372,12 +316,13 @@ Provide insights as a JSON array of strings, for example: ["Insight 1 here", "In
 
                     # Construct the function response as a dictionary for the LLM
                     # This structure is what the Gemini API expects for function responses.
+                    summarized_content = summarize_tool_result(tool_execution_result, args)
                     function_response_content_for_llm = [
                         {
                             "function_response": {
                                 "name": function_name,
                                 "response": {
-                                    "content": tool_execution_result, # The actual data from our function
+                                    "content": summarized_content,
                                 }
                             }
                         }
