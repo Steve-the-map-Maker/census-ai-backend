@@ -1,7 +1,11 @@
-from fastapi import FastAPI, HTTPException
+from typing import Any, Dict, Optional
+
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 import os
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+
 import ai_orchestrator # Import the new AI orchestrator - back to absolute since main.py is at package root
 
 # Determine the environment - check for any production indicators
@@ -31,12 +35,23 @@ else:
     origins = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
     ]
     
 
 print(f"CORS Origins configured: {origins}")
 
 app = FastAPI()
+
+# Temporary request/response logging to diagnose 400 preflight errors
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    print(f"Incoming request: {request.method} {request.url}")
+    print(f"  Headers: {dict(request.headers)}")
+    response = await call_next(request)
+    print(f"Response status: {response.status_code} for {request.method} {request.url}")
+    return response
 
 # CORS middleware configuration - more permissive for production debugging
 app.add_middleware(
@@ -54,15 +69,28 @@ print("CORS middleware configured successfully")
 async def read_root():
     return {"message": "Census AI Backend is running"}
 
+class AskAIRequest(BaseModel):
+    """Typed request payload for /ask_ai."""
+
+    query: str = Field(..., description="User's natural-language query")
+    conversation_context: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional conversational context payload captured on the frontend",
+    )
+
+
 @app.post("/ask_ai")
-async def ask_ai(query_data: dict):
-    user_query = query_data.get("query")
+async def ask_ai(query_data: AskAIRequest):
+    user_query = query_data.query.strip()
     if not user_query:
         raise HTTPException(status_code=400, detail="Query cannot be empty")
 
     print(f"Received query: {user_query}")
     try:
-        ai_response = await ai_orchestrator.get_ai_response(user_query)
+        ai_response = await ai_orchestrator.get_ai_response(
+            user_query,
+            conversation_context=query_data.conversation_context,
+        )
         # Phase 3: ai_response is now a dict, not just a string
         print(f"AI response: {ai_response}")
         
@@ -81,8 +109,11 @@ async def ask_ai(query_data: dict):
         raise HTTPException(status_code=500, detail=f"Error processing your request with the AI: {str(e)}")
 
 @app.options("/ask_ai")
-async def ask_ai_options():
-    """Handle CORS preflight requests"""
-    return {"message": "OK"}
+async def ask_ai_options(request: Request) -> Response:
+    """Handle CORS preflight requests and log headers for debugging."""
+    print("Received CORS preflight for /ask_ai with headers:")
+    for header, value in request.headers.items():
+        print(f"  {header}: {value}")
+    return Response(status_code=200)
 
 

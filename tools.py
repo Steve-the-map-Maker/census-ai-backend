@@ -17,6 +17,145 @@ MAX_ACS_YEAR = int(os.getenv("MAX_ACS_YEAR", str(DEFAULT_ACS_YEAR)))
 _TIME_SERIES_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
+def _coerce_numeric(value: Any) -> Optional[float]:
+    coerced = _safe_float(value)
+    if coerced is None and isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return coerced
+
+
+def _row_matches_filter(row: Dict[str, Any], condition: Dict[str, Any]) -> bool:
+    """Evaluate a single filter condition against a row."""
+
+    if not isinstance(condition, dict):
+        return True
+
+    field = condition.get("field")
+    if not field:
+        return True
+
+    operator = str(condition.get("operator", "eq")).lower()
+    target_value = condition.get("value")
+    row_value = row.get(field)
+
+    if operator in {"eq", "equals"}:
+        return row_value == target_value
+    if operator in {"neq", "not_equals"}:
+        return row_value != target_value
+    if operator in {"contains", "includes"}:
+        if row_value is None or target_value is None:
+            return False
+        return str(target_value).lower() in str(row_value).lower()
+
+    numeric_row = _coerce_numeric(row_value)
+    numeric_target = _coerce_numeric(target_value)
+    if numeric_row is None or numeric_target is None:
+        return False
+
+    if operator in {"gt", "greater_than"}:
+        return numeric_row > numeric_target
+    if operator in {"gte", "ge", "greater_or_equal"}:
+        return numeric_row >= numeric_target
+    if operator in {"lt", "less_than"}:
+        return numeric_row < numeric_target
+    if operator in {"lte", "le", "less_or_equal"}:
+        return numeric_row <= numeric_target
+
+    return True
+
+
+def _apply_filters(rows: List[Dict[str, Any]], filters: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    if not filters:
+        return rows
+    filtered: List[Dict[str, Any]] = []
+    for row in rows:
+        if all(_row_matches_filter(row, condition) for condition in filters):
+            filtered.append(row)
+    return filtered
+
+
+def _apply_sort(rows: List[Dict[str, Any]], sort_spec: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not sort_spec:
+        return rows
+
+    field = sort_spec.get("field")
+    if not field:
+        return rows
+
+    direction = str(sort_spec.get("direction", "desc")).lower()
+    reverse = direction in {"desc", "descending", "-1"}
+
+    def sort_key(row: Dict[str, Any]) -> Any:
+        numeric_value = _coerce_numeric(row.get(field))
+        return numeric_value if numeric_value is not None else row.get(field)
+
+    try:
+        return sorted(rows, key=sort_key, reverse=reverse)
+    except TypeError:
+        return rows
+
+
+def refine_dashboard_data(
+    raw_payload: Dict[str, Any],
+    filters: Optional[List[Dict[str, Any]]] = None,
+    sort: Optional[Dict[str, Any]] = None,
+    limit: Optional[int] = None,
+    current_year: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Refine an existing dashboard payload without issuing new Census API calls."""
+
+    if not isinstance(raw_payload, dict):
+        return {"error": "raw_payload must be an object"}
+
+    payload = copy.deepcopy(raw_payload)
+    metadata = payload.setdefault("metadata", {})
+
+    data_rows = payload.get("data")
+    if not isinstance(data_rows, list):
+        data_rows = []
+
+    working_rows = [dict(row) for row in data_rows]
+
+    if current_year is not None:
+        metadata["active_year"] = current_year
+        year_filtered = [row for row in working_rows if str(row.get("year")) == str(current_year)]
+        if year_filtered:
+            working_rows = year_filtered
+
+    working_rows = _apply_filters(working_rows, filters)
+    working_rows = _apply_sort(working_rows, sort)
+
+    if isinstance(limit, int) and limit > 0:
+        working_rows = working_rows[:limit]
+        metadata["applied_limit"] = limit
+
+    if filters:
+        metadata["applied_filters"] = copy.deepcopy(filters)
+    if sort:
+        metadata["applied_sort"] = copy.deepcopy(sort)
+
+    payload["data"] = working_rows
+
+    summary_components: List[str] = []
+    if filters:
+        summary_components.append("filters applied")
+    if sort:
+        summary_components.append("sorted")
+    if limit:
+        summary_components.append(f"top {limit}")
+    if current_year is not None:
+        summary_components.append(f"year {current_year}")
+
+    if summary_components:
+        base_summary = payload.get("summary_text", "Refined dashboard view")
+        payload["summary_text"] = f"{base_summary} (" + ", ".join(summary_components) + ")"
+
+    return payload
+
+
 def _normalize_geography_level(geography_level: str | None) -> str:
     if not geography_level:
         return ""
@@ -456,6 +595,7 @@ async def get_demographic_time_series(
         "geography_level": request_config["normalized_geography_level"],
         "geography_display": request_config["requested_geography_level"],
         "state_name": request_config.get("state_name"),
+        "state_fips": request_config.get("state_fips"),
         "county_name": request_config.get("county_name"),
         "place_name": request_config.get("place_name"),
         "variables": request_config.get("variables"),

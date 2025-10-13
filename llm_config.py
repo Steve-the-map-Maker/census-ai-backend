@@ -19,7 +19,9 @@ You can use EITHER variables OR derived_metrics (or both). geography_level is al
 
 Available derived metrics: male_female_difference, unemployment_percentage, owner_occupied_percentage, poverty_percentage, bachelors_degree_percentage, housing_vacancy_rate.
 
-When users ask comparative or time-series questions, determine the appropriate variable or derived metric and use it to create meaningful visualizations."""
+When users ask comparative or time-series questions, determine the appropriate variable or derived metric and use it to create meaningful visualizations.
+
+When the user wants to narrow or filter the existing dashboard view (top N, focus on a year, apply filters), call refine_dashboard_data with the previously returned payload before making a new Census API request."""
 
 
 def _build_get_demographic_data_tool() -> Tool:
@@ -163,10 +165,68 @@ Provide the same geography parameters as single-year requests plus start and end
         },
     )
 
+    refine_dashboard_data_declaration = FunctionDeclaration(
+        name="refine_dashboard_data",
+        description="""Refine an existing dashboard without calling the Census API. Use this to apply filters, sorting, limits, or year focus on the current dataset.
+
+Always provide the raw_payload copied from the previous response if you plan to refine it. Prefer this tool before issuing another Census request when the user asks for narrower views (e.g., top 5, filter to a year).
+""",
+        parameters={
+            "type": "object",
+            "properties": {
+                "raw_payload": {
+                    "type": "object",
+                    "description": "The complete structured payload previously returned (dashboard_data or time_series_dashboard).",
+                },
+                "filters": {
+                    "type": "array",
+                    "description": "Optional set of filter instructions to apply to the data rows.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "field": {"type": "string"},
+                            "operator": {
+                                "type": "string",
+                                "description": "Supported: eq, neq, contains, gt, gte, lt, lte",
+                            },
+                            "value": {
+                                "type": "string",
+                                "description": "Value to compare against. Convert numeric targets to strings if needed.",
+                            },
+                        },
+                        "required": ["field", "operator", "value"],
+                    },
+                },
+                "sort": {
+                    "type": "object",
+                    "description": "Sorting instructions for the refined view.",
+                    "properties": {
+                        "field": {"type": "string"},
+                        "direction": {
+                            "type": "string",
+                            "enum": ["asc", "desc"],
+                        },
+                    },
+                    "required": ["field"],
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Optional maximum number of rows to keep (e.g., top 5).",
+                },
+                "current_year": {
+                    "type": "integer",
+                    "description": "Focus the dataset on a single year when available.",
+                },
+            },
+            "required": ["raw_payload"],
+        },
+    )
+
     return Tool(
         function_declarations=[
             get_demographic_data_declaration,
             get_demographic_time_series_declaration,
+            refine_dashboard_data_declaration,
         ]
     )
 

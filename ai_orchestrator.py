@@ -1,7 +1,7 @@
 import os
 import json
 import asyncio
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from proto.marshal.collections.repeated import RepeatedComposite
 
@@ -13,6 +13,7 @@ from tools import (
     get_demographic_data,
     get_demographic_time_series,
     calculate_summary_statistics,
+    refine_dashboard_data,
 )  # TEMP: absolute import for testing
 
 load_dotenv()
@@ -34,12 +35,45 @@ model = genai.GenerativeModel(
 AVAILABLE_FUNCTIONS = {
     "get_demographic_data": get_demographic_data,
     "get_demographic_time_series": get_demographic_time_series,
+    "refine_dashboard_data": refine_dashboard_data,
 }
 
 DEFAULT_HISTORY_LIMIT = int(os.getenv("LLM_HISTORY_LIMIT", "6"))
 NON_VALUE_KEYS = {"state", "county", "tract", "place", "zip code tabulation area"}
 MAP_TOOL_HINT = "Hint: Use the get_demographic_data tool when answering geographic visualization questions."
 TIME_SERIES_TOOL_HINT = "Hint: Use the get_demographic_time_series tool when users ask about change over time or trends."
+REFINEMENT_TOOL_HINT = "Hint: When adjusting the current dashboard view, prefer refine_dashboard_data to reuse existing results before calling Census APIs again."
+
+
+def _build_context_summary(context: Dict[str, Any]) -> str:
+    """Create a concise summary string describing the existing dashboard state."""
+
+    if not context:
+        return ""
+
+    summary_parts: List[str] = []
+
+    dashboard_summary = context.get("dashboard_summary")
+    if dashboard_summary:
+        summary_parts.append(f"Current view: {dashboard_summary}")
+
+    current_year = context.get("current_year")
+    if current_year is not None:
+        summary_parts.append(f"Focused year: {current_year}")
+
+    available_years = context.get("available_years")
+    if isinstance(available_years, list) and available_years:
+        summary_parts.append(f"Available years: {available_years[:12]}{'...' if len(available_years) > 12 else ''}")
+
+    active_filters = context.get("active_filters")
+    if active_filters:
+        summary_parts.append(f"Active filters: {active_filters}")
+
+    derived_metrics = context.get("derived_metrics")
+    if derived_metrics:
+        summary_parts.append(f"Derived metrics in use: {derived_metrics}")
+
+    return " ".join(summary_parts)
 
 
 def _normalize_tool_value(value: Any) -> Any:
@@ -66,16 +100,32 @@ def truncate_history(history: List[Dict[str, Any]] | None, max_messages: int = D
     return history[-max_messages:]
 
 
-def build_query_prompt(user_query: str, is_map_request: bool, is_time_series_request: bool) -> str:
-    """Append lightweight hints for map or time-series requests without duplicating the system prompt."""
+def build_query_prompt(
+    user_query: str,
+    is_map_request: bool,
+    is_time_series_request: bool,
+    conversation_context: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Append context and lightweight hints for map, time-series, or refinement requests."""
+
+    prompt_prefix = user_query
     hints: List[str] = []
+
+    if conversation_context:
+        context_summary = _build_context_summary(conversation_context)
+        context_intro = "The user is continuing a conversation."
+        if context_summary:
+            context_intro = f"{context_intro} {context_summary}"
+        prompt_prefix = f"{context_intro}\n\nNew request: {user_query}"
+        hints.append(REFINEMENT_TOOL_HINT)
+
     if is_map_request:
         hints.append(MAP_TOOL_HINT)
     if is_time_series_request:
         hints.append(TIME_SERIES_TOOL_HINT)
     if hints:
-        return f"{user_query}\n\n" + "\n".join(hints)
-    return user_query
+        return f"{prompt_prefix}\n\n" + "\n".join(hints)
+    return prompt_prefix
 
 
 def detect_time_series_request(user_query: str) -> bool:
@@ -364,7 +414,11 @@ def build_time_series_dashboard(
             "total_tokens": total_prompt_tokens + total_completion_tokens,
         },
     }
-async def get_ai_response(user_query: str, chat_history: list = None) -> dict:
+async def get_ai_response(
+    user_query: str,
+    chat_history: Optional[List[Dict[str, Any]]] = None,
+    conversation_context: Optional[Dict[str, Any]] = None,
+) -> dict:
     """
     Generates a response from the Gemini Pro model, potentially using tools.
     Implements a two-step process for tool usage:
@@ -385,9 +439,18 @@ async def get_ai_response(user_query: str, chat_history: list = None) -> dict:
         is_time_series_request = detect_time_series_request(user_query)
 
         trimmed_history = truncate_history(chat_history)
+        if conversation_context:
+            context_keys = ", ".join(sorted(conversation_context.keys()))
+            print(f"Conversation context provided with keys: {context_keys}")
+
         current_chat_session = model.start_chat(history=trimmed_history)
 
-        query_for_llm = build_query_prompt(user_query, is_map_request, is_time_series_request)
+        query_for_llm = build_query_prompt(
+            user_query,
+            is_map_request,
+            is_time_series_request,
+            conversation_context=conversation_context,
+        )
 
         print(
             f"\nSending to Gemini (1st call): Query: '{user_query}' "
@@ -435,6 +498,18 @@ async def get_ai_response(user_query: str, chat_history: list = None) -> dict:
                     
                     record_count = len(tool_execution_result) if isinstance(tool_execution_result, list) else 'n/a'
                     print(f"Tool '{function_name}' executed. Result type: {type(tool_execution_result)}, records: {record_count}")
+                    if function_name == "refine_dashboard_data" and isinstance(tool_execution_result, dict):
+                        print("Refinement tool executed, returning refined payload without additional LLM round-trip.")
+                        refined_payload = dict(tool_execution_result)
+                        refined_payload.setdefault(
+                            "token_usage",
+                            {
+                                "prompt_tokens": total_prompt_tokens,
+                                "completion_tokens": total_completion_tokens,
+                                "total_tokens": total_prompt_tokens + total_completion_tokens,
+                            },
+                        )
+                        return refined_payload
                     if function_name == "get_demographic_time_series":
                         print("Time-series response detected, constructing dashboard output.")
                         return build_time_series_dashboard(
@@ -545,6 +620,14 @@ async def get_ai_response(user_query: str, chat_history: list = None) -> dict:
                             except:
                                 serializable_data = data_items  # fallback
                             
+                            state_name_arg = args.get("state_name")
+                            state_fips_value = None
+                            if sample_item.get("state") is not None:
+                                try:
+                                    state_fips_value = str(sample_item.get("state")).zfill(2)
+                                except Exception:
+                                    state_fips_value = None
+
                             # 6. Construct dashboard response
                             response = {
                                 "type": "dashboard_data",
@@ -554,7 +637,9 @@ async def get_ai_response(user_query: str, chat_history: list = None) -> dict:
                                     "geography_level": str(args.get("geography_level", "")),
                                     "display_variable_id": str(display_variable_id),
                                     "variable_labels": variable_labels,
-                                    "available_variables": all_variables
+                                    "available_variables": all_variables,
+                                    "state_name": state_name_arg,
+                                    "state_fips": state_fips_value,
                                 },
                                 "charts": charts,
                                 "summary_statistics": summary_statistics,
